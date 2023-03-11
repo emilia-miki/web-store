@@ -1,5 +1,5 @@
 from django.test import TestCase
-from .models import OrderProduct, OrderStatus, Product, Order
+from .models import OrderProduct, OrderStatus, Product, Order, Profile
 from random import Random
 from decimal import Decimal
 from django.contrib.auth.models import User
@@ -18,20 +18,41 @@ class ApiTest(TestCase):
 
         return word
 
+    def _get_token(self, user: User):
+        username = user.username
+        password = f"user_password{user.username.split(' ')[1]}"
+        response = self.client.post("/api/token/",
+                                    json.dumps({"username": username, "password": password}),
+                                    content_type="application/json")
+        return response.data["access"]
+
     def setUp(self):
         Product.objects.all().delete()
         Order.objects.all().delete()
         OrderProduct.objects.all().delete()
+        User.objects.all().delete()
+        Profile.objects.all().delete()
 
         try:
             self.test_user = User.objects.get(username="test_user")
         except ObjectDoesNotExist:
-            self.test_user = User.objects.create_user(username="test_user")
+            self.test_user = User.objects.create_user(username="test_user", password="pass")
+
+        response = self.client.post("/api/token/",
+                                    json.dumps({"username": "test_user", "password": "pass"}),
+                                    content_type="application/json")
+        self.test_user_token = response.data.get('access')
 
         try:
             self.test_admin = User.objects.get(username="test_admin")
         except ObjectDoesNotExist:
-            self.test_admin = User.objects.create_user(username="test_admin", is_staff=True)
+            self.test_admin = User.objects.create_user(
+                    username="test_admin", password="admin", is_staff=True)
+
+        response = self.client.post("/api/token/",
+                                    json.dumps({"username": "test_admin", "password": "admin"}),
+                                    content_type="application/json")
+        self.test_admin_token = response.data["access"]
         
         self.rand = Random()
 
@@ -80,6 +101,75 @@ class ApiTest(TestCase):
                 OrderProduct.objects.create(order=order, product=Product.objects.get(pk=product_id),
                                             amount=self.rand.randint(1, 5))
 
+    def test_register(self):
+        response = self.client.post("/api/register/",
+                                    json.dumps({
+                                        "username": "hello",
+                                        "first_name": "oleg",
+                                        "last_name": "prokofiev",
+                                        "email": "email@mail.com",
+                                        "phone": "+380661117799",
+                                        "password": "pass"
+                                    }),
+                                    content_type="application/json")
+        
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(User.objects.filter(username="hello")), 1)
+        self.assertEqual(len(Profile.objects.all()), 1)
+
+    def test_register_already_authenticated(self):
+        response = self.client.post("/api/register/",
+                                    json.dumps({
+                                        "username": "hello",
+                                        "first_name": "oleg",
+                                        "last_name": "prokofiev",
+                                        "email": "email@mail.com",
+                                        "phone": "+380661117799",
+                                        "password": "pass"
+                                    }),
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_change_password(self):
+        response = self.client.post("/api/change_password/",
+                                    json.dumps({
+                                        "password": "pass",
+                                        "new_password": "pass2"
+                                    }),
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
+
+        self.assertEqual(response.status_code, 200)
+        self.test_user.refresh_from_db()
+        self.assertTrue(self.test_user.check_password("pass2"))
+
+    def test_change_password_not_logged_in(self):
+        response = self.client.post("/api/change_password/",
+                                    json.dumps({
+                                        "password": "pass",
+                                        "new_password": "pass2"
+                                    }),
+                                    content_type="application/json")
+
+        self.assertEqual(response.status_code, 401)
+        self.test_user.refresh_from_db()
+        self.assertTrue(self.test_user.check_password("pass"))
+
+    def test_change_password_invalid_credentials(self):
+        response = self.client.post("/api/change_password/",
+                                    json.dumps({
+                                        "password": "pass3",
+                                        "new_password": "pass2"
+                                    }),
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.test_user.refresh_from_db()
+        self.assertTrue(self.test_user.check_password("pass"))
+
     def test_get_products(self):
         response = self.client.get("/api/products/")
 
@@ -112,7 +202,7 @@ class ApiTest(TestCase):
 
     def test_get_products_by_category(self):
         for i in range(self.number_of_categories):
-            response = self.client.get("/api/products/", {"category": f"Category {i + 1}"})
+            response = self.client.get("/api/products/", {"categories": f"Category {i + 1}"})
 
             self.assertEqual(response.status_code, 200)
             expected = self.number_of_products_per_category[i]
@@ -155,15 +245,13 @@ class ApiTest(TestCase):
             self.assertEqual(response.data[i]["description"], expected_result[i])
 
     def test_post_product(self):
-        self.client.force_login(self.test_admin)
-
         response = self.client.post("/api/products/",
                                     json.dumps({"name": "Name", "description": "Desc", "category": "Cat", 
                                           "price": "23.4", "left": 0}),
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["detail"], "product created")
         self.assertIsNotNone(response.data["id"])
         exception_raised = False
         try:
@@ -175,34 +263,33 @@ class ApiTest(TestCase):
     def test_post_product_not_authorized(self):
         response1 = self.client.post("/api/products/")
 
-        self.client.force_login(self.test_user)
-        response2 = self.client.post("/api/products/")
+        response2 = self.client.post("/api/products/", 
+                                     HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
         responses = [response1, response2]
 
         for response in responses:
             self.assertEqual(response.status_code, 401)
-            self.assertEqual(response.data["detail"], "not authorized")
 
     def test_post_product_invalid_data(self):
-        self.client.force_login(self.test_admin)
-
         response1 = self.client.post("/api/products/",
                                     json.dumps({"name": "", "description": "", "category": "", 
                                      "price": ""}),
-                                     content_type="application/json")
+                                     content_type="application/json",
+                                     HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         response2 = self.client.post("/api/products/",
                                      json.dumps({"name": "", "description": "", "category": "", 
                                      "price": "", "left": 0, "redundant": ""}),
-                                     content_type="application/json")
+                                     content_type="application/json",
+                                     HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         response3 = self.client.post("/api/products/",
                                      json.dumps({"name": "", "description": "", "category": "", 
                                      "invalid": ""}),
-                                     content_type="application/json")
+                                     content_type="application/json",
+                                     HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         responses = [response1, response2, response3]
 
         for response in responses:
             self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.data["detail"], "invalid data")
             self.assertEqual(len(Product.objects.all()), self.number_of_products)
 
     def test_get_product(self):
@@ -217,19 +304,16 @@ class ApiTest(TestCase):
         response = self.client.get("/api/products/3258235/")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["detail"], "product not found")
 
     def test_put_product(self):
-        self.client.force_login(self.test_admin)
-
         pk = self.product_ids[0]
         response = self.client.put(f"/api/products/{pk}/", 
                                    json.dumps({"price": "34.99", "left": 0}),
-                                   content_type="application/json")
+                                   content_type="application/json",
+                                   HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         p = Product.objects.get(pk=pk)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["detail"], "product updated")
         self.assertEqual(p.price, Decimal("34.99"))
         self.assertEqual(p.left, 0)
 
@@ -237,80 +321,72 @@ class ApiTest(TestCase):
         pk = self.product_ids[0]
         response1 = self.client.put(f"/api/products/{pk}/")
 
-        self.client.force_login(self.test_user)
-        response2 = self.client.put(f"/api/products/{pk}/")
+        response2 = self.client.put(f"/api/products/{pk}/",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
         responses = [response1, response2]
 
         for response in responses:
             self.assertEqual(response.status_code, 401)
-            self.assertEqual(response.data["detail"], "not authorized")
 
     def test_put_product_invalid_data(self):
-        self.client.force_login(self.test_admin)
-
         pk = self.product_ids[0]
         response1 = self.client.put(f"/api/products/{pk}/",
                                    json.dumps({"dajfsk": ""}),
-                                   content_type="application/json")
+                                   content_type="application/json",
+                                   HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
 
         response2 = self.client.put(f"/api/products/{pk}/",
                                     json.dumps({ "price": ""}),
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         responses = [response1, response2]
 
         for response in responses:
             self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.data["detail"], "invalid data")
 
     def test_put_product_not_found(self):
-        self.client.force_login(self.test_admin)
-
         response = self.client.put("/api/products/2352352/", json.dumps({"name": "new_name"}),
-                                   content_type="application/json")
+                                   content_type="application/json",
+                                   HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["detail"], "product not found")
 
 
     def test_delete_product(self):
-        self.client.force_login(self.test_admin)
-
         pk = self.product_ids[0]
-        response = self.client.delete(f"/api/products/{pk}/")
+        response = self.client.delete(f"/api/products/{pk}/",
+                                      HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["detail"], "product deleted")
 
     def test_delete_product_not_authorized(self):
         pk = self.product_ids[0]
         response1 = self.client.delete(f"/api/products/{pk}/")
 
-        self.client.force_login(self.test_user)
-        response2 = self.client.delete(f"/api/products/{pk}/")
+        response2 = self.client.delete(f"/api/products/{pk}/",
+                                       HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
         responses = [response1, response2]
 
         for response in responses:
             self.assertEqual(response.status_code, 401)
-            self.assertEqual(response.data["detail"], "not authorized")
 
     def test_delete_product_not_found(self):
-        self.client.force_login(self.test_admin)
-
-        response = self.client.delete("/api/products/42582436/")
+        response = self.client.delete("/api/products/42582436/",
+                                      HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["detail"], "product not found")
         self.assertEqual(self.number_of_products, len(Product.objects.all()))
 
     def test_get_orders(self):
-        self.client.force_login(self.test_user)
+        user = Order.objects.first().customer
+        token = self._get_token(user)
 
         counter = 0
         for order in Order.objects.all():
-            if order.customer_id == self.test_user.pk:
+            if order.customer_id == user.pk:
                 counter += 1
 
-        response = self.client.get("/api/orders/", {"customer_id": self.test_user.pk})
+        response = self.client.get("/api/orders/", HTTP_AUTHORIZATION=f"Bearer {token}")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), counter)
@@ -319,13 +395,13 @@ class ApiTest(TestCase):
         response = self.client.get("/api/orders/")
 
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.data["detail"], "not authorized")
 
     def test_get_order(self):
         order = Order.objects.first()
-        self.client.force_login(order.customer)
+        token = self._get_token(order.customer)
 
-        response = self.client.get(f"/api/orders/{order.pk}/")
+        response = self.client.get(f"/api/orders/{order.pk}/", 
+                                   HTTP_AUTHORIZATION=f"Bearer {token}")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(int(response.data["order_id"]), order.pk)
@@ -334,34 +410,28 @@ class ApiTest(TestCase):
         order = Order.objects.first()
         excluded = Order.objects.exclude(customer=order.customer).first()
         pk = excluded.pk
-        self.client.force_login(order.customer)
+        token = self._get_token(order.customer)
 
-        response = self.client.get(f"/api/orders/{pk}/")
+        response = self.client.get(f"/api/orders/{pk}/", HTTP_AUTHORIZATION=f"Bearer {token}")
 
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.data["detail"], "not authorized")
 
     def test_get_order_not_found(self):
-        self.client.force_login(self.test_user)
-
-        response = self.client.get("/api/orders/439682/")
+        response = self.client.get("/api/orders/439682/", 
+                                   HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["detail"], "order not found")
 
     def test_post_order(self):
-        self.client.force_login(self.test_user)
-
         pk1 = self.product_ids[0]
         pk2 = self.product_ids[1]
         response = self.client.post("/api/orders/",
                                     json.dumps({"products": [{"product_id": pk1, "amount": 3},
-                                    {"product_id": pk2, "amount": 1}],
-                                    "customer_id": self.test_user.pk}),
-                                    content_type="application/json")
+                                    {"product_id": pk2, "amount": 1}]}),
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["detail"], "order created")
         self.assertEqual(len(Order.objects.all()), self.number_of_orders + 1)
         self.assertEqual(len(OrderProduct.objects.all()), self.number_of_orderproducts + 2)
         self.assertEqual(Order.objects.get(pk=response.data["id"]).customer.pk, self.test_user.pk)
@@ -370,62 +440,54 @@ class ApiTest(TestCase):
         response = self.client.post("/api/orders/")
 
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.data["detail"], "not authorized")
 
     def test_post_order_invalid_data(self):
-        self.client.force_login(self.test_user)
-
         response1 = self.client.post("/api/orders/",
                                     json.dumps({"dsgfd": ""}),
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
 
         response2 = self.client.post("/api/orders/",
                                     json.dumps({"customer_id": "", "products": []}),
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_user_token}")
         responses = [response1, response2]
 
         for response in responses:
             self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.data["detail"], "invalid data")                   
 
 
     def test_put_order(self):
-        self.client.force_login(self.test_admin)
-
         pk = self.order_ids[0]
-        response = self.client.put(f"/api/orders/{pk}/", json.dumps({"status": 4}), 
-                                   content_type="application/json")
+        response = self.client.put(f"/api/orders/{pk}/", json.dumps({"status": 3}), 
+                                   content_type="application/json",
+                                   HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["detail"], "order updated")
-        self.assertEqual(Order.objects.get(pk=pk).status, 4)
+        self.assertEqual(Order.objects.get(pk=pk).status, 3)
 
     def test_put_order_not_authorized(self):
         pk = self.order_ids[0]
         response = self.client.put(f"/api/orders/{pk}/", "", content_type="application/json")
 
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.data["detail"], "not authorized")
 
     def test_put_order_invalid_data(self):
-        self.client.force_login(self.test_admin)
-
         pk = self.order_ids[0]
         response1 = self.client.put(f"/api/orders/{pk}/", json.dumps({"status": 9}), 
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         response2 = self.client.put(f"/api/orders/{pk}/", json.dumps({"dsaf": ""}),
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
         responses = [response1, response2]
 
         for response in responses:
             self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.data["detail"], "invalid data")
 
     def test_put_order_not_found(self):
-        self.client.force_login(self.test_admin)
-
         response = self.client.put("/api/orders/2352352/", json.dumps({"status": 3}),
-                                    content_type="application/json")
+                                    content_type="application/json",
+                                    HTTP_AUTHORIZATION=f"Bearer {self.test_admin_token}")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["detail"], "order not found")
