@@ -1,1 +1,2 @@
-#webstore
+# webstore
+This is a Single-Page Web Application for an imaginary clothes store. The backend is written in Python and uses the Django framework and Django REST framework. The frontend is set up with Vite, written in JavaScript with React and uses Mantine for styles. Authorization is set up statelessly, using JWT tokens and djangorestframework-simplejwt. The database used is PostgreSQL, testing was done with it running in Docker. The data for testing was parsed from an existing web store using a scipt inside the populate_database folder and BeautifulSoup (which simplifies HTML parsing).
